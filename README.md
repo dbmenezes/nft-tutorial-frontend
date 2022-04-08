@@ -1,4 +1,4 @@
-nft-mint-frontend
+NCD submit
 ==================
 
 This [React] app was initialized with [create-near-app]
