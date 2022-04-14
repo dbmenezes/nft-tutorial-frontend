@@ -1,114 +1,122 @@
-use std::collections::HashMap;
+
+// To conserve gas, efficient serialization is achieved through Borsh (http://borsh.io/)
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::collections::{LazyOption, LookupMap, UnorderedMap, UnorderedSet};
-use near_sdk::json_types::{Base64VecU8, U128};
-use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::collections::LookupMap;
 use near_sdk::{
-    env, near_bindgen, AccountId, Balance, CryptoHash, PanicOnDefault, Promise, PromiseOrValue,
+    env, near_bindgen, AccountId, Balance, CryptoHash, PanicOnDefault, Promise, PromiseOrValue,setup_alloc,
+    serde::{Deserialize, Serialize},
 };
 
-use crate::internal::*;
-pub use crate::metadata::*;
-pub use crate::mint::*;
-pub use crate::nft_core::*;
-pub use crate::approval::*;
-pub use crate::royalty::*;
-pub use crate::events::*;
-
-mod internal;
-mod approval; 
-mod enumeration; 
-mod metadata; 
-mod mint; 
-mod nft_core; 
-mod royalty; 
-mod events;
-
-/// This spec can be treated like a version of the standard.
-pub const NFT_METADATA_SPEC: &str = "1.0.0";
-/// This is the name of the NFT standard we're using
-pub const NFT_STANDARD_NAME: &str = "nep171";
+setup_alloc!();
 
 #[near_bindgen]
-#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Funding {
+    funding_value: i8,
+    funding_account_id: String,
+    partial_funding_value: i8
+
+}
+impl Funding {
+    pub fn inc_funding_value(&mut self,amount: i8){
+        self.partial_funding_value += amount;
+    }
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize)]
 pub struct Contract {
-    //contract owner
-    pub owner_id: AccountId,
-
-    //keeps track of all the token IDs for a given account
-    pub tokens_per_owner: LookupMap<AccountId, UnorderedSet<TokenId>>,
-
-    //keeps track of the token struct for a given token ID
-    pub tokens_by_id: LookupMap<TokenId, Token>,
-
-    //keeps track of the token metadata for a given token ID
-    pub token_metadata_by_id: UnorderedMap<TokenId, TokenMetadata>,
-
-    //keeps track of the metadata for the contract
-    pub metadata: LazyOption<NFTContractMetadata>,
+    funding_memo: LookupMap<String, Funding>
 }
 
-/// Helper structure for keys of the persistent collections.
-#[derive(BorshSerialize)]
-pub enum StorageKey {
-    TokensPerOwner,
-    TokenPerOwnerInner { account_id_hash: CryptoHash },
-    TokensById,
-    TokenMetadataById,
-    NFTContractMetadata,
-    TokensPerType,
-    TokensPerTypeInner { token_type_hash: CryptoHash },
-    TokenTypesLocked,
+impl Default for Contract {
+    fn default() -> Self {
+        Self {
+            funding_memo:LookupMap::new(b"memo".to_vec())
+        }
+    }
 }
-
 #[near_bindgen]
 impl Contract {
-    /*
-        initialization function (can only be called once).
-        this initializes the contract with default metadata so the
-        user doesn't have to manually type metadata.
-    */
-    #[init]
-    pub fn new_default_meta(owner_id: AccountId) -> Self {
-        //calls the other function "new: with some default metadata and the owner_id passed in 
-        Self::new(
-            owner_id,
-            NFTContractMetadata {
-                spec: "nft-1.0.0".to_string(),
-                name: "NFT Tutorial Contract".to_string(),
-                symbol: "GOTEAM".to_string(),
-                icon: None,
-                base_uri: None,
-                reference: None,
-                reference_hash: None,
-            },
-        )
+
+    pub fn create_funding(&mut self, amount:i8 ,account_id: Option<AccountId>){
+
+        let storage_account_id = account_id
+            //convert the valid account ID into an account ID
+            .map(|a| a.into())
+            //if we didn't specify an account ID, we simply use the caller of the function
+            .unwrap_or_else(env::signer_account_id);
+        let funding = Funding { partial_funding_value: 0, funding_value: amount, funding_account_id: storage_account_id.to_string() };
+
+        self.funding_memo.insert(&storage_account_id.to_string(),&funding);
+    }
+    pub fn transfer_money(&mut self, account_id: AccountId,amount:Balance){
+        Promise::new(account_id).transfer(amount);
+
+    }
+    #[payable]
+    pub fn donate_to_funding(&mut self, amount:i8, funding_account_id: AccountId) {
+        let mut record= self.funding_memo.get(&funding_account_id.to_string()).unwrap_or_else(|| env::panic_str("Funding not found."));
+        record.inc_funding_value(amount);
+        self.funding_memo.insert(&funding_account_id.to_string(),&record);
+        if record.partial_funding_value + amount == record.funding_value {
+            self.transfer_money(funding_account_id,near_sdk::env::attached_deposit());
+        }
     }
 
-    /*
-        initialization function (can only be called once).
-        this initializes the contract with metadata that was passed in and
-        the owner_id. 
-    */
-    #[init]
-    pub fn new(owner_id: AccountId, metadata: NFTContractMetadata) -> Self {
-        //create a variable of type Self with all the fields initialized. 
-        let this = Self {
-            //Storage keys are simply the prefixes used for the collections. This helps avoid data collision
-            tokens_per_owner: LookupMap::new(StorageKey::TokensPerOwner.try_to_vec().unwrap()),
-            tokens_by_id: LookupMap::new(StorageKey::TokensById.try_to_vec().unwrap()),
-            token_metadata_by_id: UnorderedMap::new(
-                StorageKey::TokenMetadataById.try_to_vec().unwrap(),
-            ),
-            //set the owner_id field equal to the passed in owner_id. 
-            owner_id,
-            metadata: LazyOption::new(
-                StorageKey::NFTContractMetadata.try_to_vec().unwrap(),
-                Some(&metadata),
-            ),
-        };
-
-        //return the Contract object
-        this
+    pub fn get_funding(self, user: AccountId) -> Funding {
+        match self.funding_memo.get(&user.to_string()){
+            Some(x)=>x,
+            None => panic!("Didnt find funding"),
+        }
     }
+}
+
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::{testing_env, VMContext};
+    use std::convert::TryInto;
+
+    fn get_context(is_view: bool) -> VMContext {
+        VMContextBuilder::new()
+            .signer_account_id("bob.near".parse().unwrap())
+            .is_view(is_view)
+            .build()
+    }
+
+    #[test]
+    fn test_create_funding() {
+        let key = "bob_near";
+
+        let context = get_context(false);
+        testing_env!(context);
+        let mut contract = Contract::default();
+        contract.create_funding(10,Some(key.parse().unwrap()));
+
+        assert_eq!( contract.funding_memo.get(&key.to_string()).unwrap().funding_value,10);
+
+    }
+
+    #[test]
+    fn test_donate_funding() {
+        let key1 = "bob_near";
+
+        let context = get_context(false);
+        testing_env!(context);
+        let mut contract = Contract::default();
+        contract.create_funding(10,Some(key1.parse().unwrap()));
+        let mut record = contract.funding_memo.get(&key1.to_string()).unwrap_or_else(|| env::panic_str("Record not found."));
+
+        record.inc_funding_value(5);
+        contract.funding_memo.insert(&key1.to_string(), &record);
+
+        assert_eq!( contract.funding_memo.get(&key1.to_string()).unwrap().partial_funding_value,5)
+
+    }
+
+
 }

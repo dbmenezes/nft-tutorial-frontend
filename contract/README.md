@@ -1,7 +1,7 @@
 nft-mint-frontend Smart Contract
 ==================
 
-A [smart contract] written in [Rust] for an app initialized with [create-near-app]
+A Funding [smart contract] written in [Rust] for an app initialized with [create-near-app]
 
 
 Quick Start
